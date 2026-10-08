@@ -5,6 +5,7 @@ Supports both Chinese and English dialogue with RAG (Retrieval Augmented Generat
 Works with Ollama for generation and embeddings
 NOW INCLUDES: DuckDuckGo Search integration, dynamic model selection, language control, dialogue history
 SUPPORTS: Simplified Chinese, Traditional Chinese, English with strict language enforcement
+REAL-TIME NEWS: Google News RSS feed integration for latest public news updates
 """
 
 import os
@@ -13,6 +14,8 @@ import json
 import logging
 import math
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
@@ -38,6 +41,7 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "600"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "3"))
+REAL_TIME_TOP_K = int(os.getenv("REAL_TIME_TOP_K", "3"))
 
 # Language definitions
 LANGUAGE_OPTIONS = {
@@ -172,24 +176,18 @@ class DuckDuckGoSearchClient:
         self.endpoint = "https://api.duckduckgo.com"
         self.enabled = True
         self.session = requests.Session()
-        # Set proper User-Agent to avoid blocking
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         })
         logger.info("DuckDuckGo Search Client initialized (free, no API key required)")
 
     def search(self, query: str, num_results: int = 3) -> List[Dict[str, str]]:
-        """
-        Search DuckDuckGo without API key
-        Returns list of dicts with 'title', 'link', 'snippet'
-        Includes retry logic for 202 (Accepted) and 429 (Rate Limited) responses
-        """
         if not query or not query.strip():
             return []
-        
+
         max_retries = 2
         retry_delay = 1
-        
+
         for attempt in range(max_retries):
             try:
                 params = {
@@ -199,27 +197,17 @@ class DuckDuckGoSearchClient:
                     "skip_disambig": 1,
                     "kl": "en-us"
                 }
-                
-                response = self.session.get(
-                    self.endpoint,
-                    params=params,
-                    timeout=15
-                )
-                
-                # Handle different status codes
+                response = self.session.get(self.endpoint, params=params, timeout=15)
+
                 if response.status_code == 200:
                     data = response.json()
                     results = []
-                    
-                    # Get instant answer/abstract
                     if data.get("AbstractText"):
                         results.append({
                             "title": data.get("Heading", query),
                             "link": data.get("AbstractURL", ""),
                             "snippet": data.get("AbstractText", "")
                         })
-                    
-                    # Get related topics as additional results
                     if data.get("RelatedTopics") and len(results) < num_results:
                         for topic in data["RelatedTopics"]:
                             if isinstance(topic, dict) and "Text" in topic:
@@ -230,54 +218,83 @@ class DuckDuckGoSearchClient:
                                 })
                             if len(results) >= num_results:
                                 break
-                    
                     return results[:num_results]
-                
                 elif response.status_code == 202:
-                    # 202 = Accepted but processing - retry after delay
                     if attempt < max_retries - 1:
-                        logger.debug(f"DuckDuckGo API returned 202 (processing). Retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
                         retry_delay *= 2
                         continue
-                    else:
-                        logger.warning(f"DuckDuckGo API still processing after {max_retries} attempts. Returning empty results.")
-                        return []
-                
+                    return []
                 elif response.status_code == 429:
-                    # Rate limited - back off
                     if attempt < max_retries - 1:
-                        logger.debug(f"DuckDuckGo rate limit (429). Retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
                         retry_delay *= 2
                         continue
-                    else:
-                        logger.warning("DuckDuckGo rate limited. Returning empty results.")
-                        return []
-                
+                    return []
                 else:
-                    logger.warning(f"DuckDuckGo API error: {response.status_code} - {response.text[:200]}")
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)
                         continue
                     return []
-                    
             except requests.exceptions.Timeout:
-                logger.warning(f"DuckDuckGo search timeout (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     retry_delay *= 2
                     continue
                 return []
             except Exception as e:
-                logger.warning(f"DuckDuckGo search failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.warning(f"DuckDuckGo search failed: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     retry_delay *= 2
                     continue
                 return []
-        
         return []
+
+# ===================== Real-Time News Client =====================
+class NewsRSSClient:
+    """
+    Fetches latest public news from Google News RSS without API key.
+    Best for real-time news summaries and current events context.
+    """
+    def __init__(self, base_url: str = "https://news.google.com/rss"):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        })
+        self.enabled = True
+
+    def search(self, query: str, num_results: int = 3) -> List[Dict[str, str]]:
+        if not query or not query.strip():
+            return []
+
+        try:
+            safe_query = urllib.parse.quote_plus(query.strip())
+            url = f"{self.base_url}/search?q={safe_query}&hl=en-US&gl=US&ceid=US:en"
+            response = self.session.get(url, timeout=15)
+            if response.status_code != 200:
+                logger.warning(f"News RSS request failed: {response.status_code}")
+                return []
+
+            root = ET.fromstring(response.content)
+            items = []
+            for item in root.findall("./channel/item")[:num_results]:
+                title = item.findtext("title", default="")
+                link = item.findtext("link", default="")
+                desc = item.findtext("description", default="")
+                pub_date = item.findtext("pubDate", default="")
+                if title or link:
+                    items.append({
+                        "title": title,
+                        "link": link,
+                        "snippet": desc,
+                        "published": pub_date,
+                    })
+            return items
+        except Exception as e:
+            logger.warning(f"News RSS fetch failed: {e}")
+            return []
 
 # ===================== Text Chunking =====================
 def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -350,13 +367,11 @@ class RAGKnowledgeBase:
 
     def rebuild_index(self):
         chunks: List[str] = []
-        chunk_meta: List[Dict] = []
 
         for doc in self.documents:
             text = doc["content"]
             for chunk in split_text_into_chunks(text, CHUNK_SIZE, CHUNK_OVERLAP):
                 chunks.append(chunk)
-                chunk_meta.append({"title": doc["title"], "path": doc["path"], "content": chunk})
 
         self.texts = chunks
         if not self.texts:
@@ -398,7 +413,6 @@ class RAGKnowledgeBase:
             except Exception as e:
                 logger.warning(f"Semantic retrieval failed: {e}")
 
-        # Fallback keyword search
         query_terms = extract_terms(query)
         if not query_terms:
             return [{"text": self.texts[0], "score": 0.0}]
@@ -446,58 +460,37 @@ def extract_terms(text: str) -> List[str]:
     return filtered
 
 def detect_language(text: str) -> str:
-    """
-    Detect if text is primarily Chinese or English
-    Returns 'english' or 'chinese_simplified' (default for Chinese)
-    """
     chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
     english_chars = len(re.findall(r"[a-zA-Z]", text))
-    
     if chinese_chars > english_chars:
-        return "chinese_simplified"  # Default to Simplified Chinese
+        return "chinese_simplified"
     return "english"
 
 def normalize_target_language(target_language: Optional[str]) -> str:
-    """
-    Normalize language input to one of: english, chinese_simplified, chinese_traditional
-    Handles aliases and aliases like 'zh-cn', 'traditional', etc.
-    """
     if target_language is None or target_language == "":
         return "english"
-
     normalized = str(target_language).strip().lower()
-    
-    # Check against LANGUAGE_OPTIONS
     if normalized in LANGUAGE_OPTIONS:
-        lang_desc = LANGUAGE_OPTIONS[normalized]
-        if "Simplified" in lang_desc:
+        if "Simplified" in LANGUAGE_OPTIONS[normalized]:
             return "chinese_simplified"
-        elif "Traditional" in lang_desc:
+        if "Traditional" in LANGUAGE_OPTIONS[normalized]:
             return "chinese_traditional"
-        elif "English" in lang_desc:
-            return "english"
-    
-    # Default fallback
+        return "english"
     return "english"
 
 def format_dialogue_history(history: List[Dict]) -> str:
-    """Format conversation history as a readable context string"""
     if not history:
         return ""
-    
     formatted = "Previous conversation context:\n"
-    for i, entry in enumerate(history[-10:], 1):  # Last 10 exchanges
+    for i, entry in enumerate(history[-10:], 1):
         formatted += f"\n[Turn {i}]\n"
         formatted += f"User: {entry.get('user', '')}\n"
         formatted += f"Assistant: {entry.get('assistant', '')}\n"
-    
     return formatted
 
 def get_current_time_context() -> str:
-    """Get current time in multiple formats for context awareness"""
     now = datetime.now(timezone.utc)
     local_now = datetime.now()
-    
     return f"""Current Time Information:
 - UTC Time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}
 - Local Time: {local_now.strftime('%Y-%m-%d %H:%M:%S')}
@@ -506,31 +499,23 @@ def get_current_time_context() -> str:
 
 # ===================== RAG LLM Wrapper =====================
 class BilingualRAGLLM:
-    def __init__(self, ollama_client: OllamaClient, knowledge_base: RAGKnowledgeBase, search_client: DuckDuckGoSearchClient):
+    def __init__(self, ollama_client: OllamaClient, knowledge_base: RAGKnowledgeBase, search_client: DuckDuckGoSearchClient, news_client: NewsRSSClient):
         self.ollama_client = ollama_client
         self.knowledge_base = knowledge_base
         self.search_client = search_client
+        self.news_client = news_client
         self.conversation_history: List[Dict] = []
 
     def create_prompt(self, user_input: str, context: str = "", dialogue_history: str = "", target_language: str = None) -> List[Dict]:
-        """
-        Create prompt with:
-        - Local knowledge base context
-        - Web search results
-        - Dialogue history
-        - Current time information
-        - STRICT output-language instruction (English, Simplified Chinese, or Traditional Chinese)
-        """
         target_language = normalize_target_language(target_language)
 
-        # Language-specific instructions
         if target_language == "chinese_simplified":
             lang_instruction = "请严格使用简体中文回答。不要混用繁体字。不要切换到英文。回答内容必须全部为简体中文，除非用户明确要求输出代码时，代码块中的语法关键字可以保持原样。"
-            response_rule = "Output language: Simplified Chinese ONLY. 严格使用简体中文。不允许切换到英文或繁体中文。"
+            response_rule = "Output language: Simplified Chinese ONLY. 不允许切换到英文或繁体中文。"
             lang_display = "Simplified Chinese"
         elif target_language == "chinese_traditional":
             lang_instruction = "請嚴格使用繁體中文回答。不要混用簡體字。不要切換到英文。回答內容必須全部為繁體中文，除非用戶明確要求輸出代碼時，代碼塊中的語法關鍵字可以保持原樣。"
-            response_rule = "Output language: Traditional Chinese ONLY. 請嚴格使用繁體中文。不允許切換到英文或簡體中文。"
+            response_rule = "Output language: Traditional Chinese ONLY. 不允許切換到英文或簡體中��。"
             lang_display = "Traditional Chinese"
         else:
             lang_instruction = "Please answer strictly in English. Do not switch to Chinese. The entire response must be in English, except code syntax itself which may stay as-is."
@@ -547,7 +532,7 @@ You are a helpful multilingual assistant that can answer questions in English, S
 {time_context}
 
 Instructions:
-- Use the provided context from local knowledge base and latest web search results if available.
+- Use the provided context from local knowledge base and latest public web or news results if available.
 - Be aware of the current date and time when answering questions about timing, schedules, or recent events.
 - If the answer is not found in the provided context, say so clearly.
 - Consider the conversation history to maintain context and coherence.
@@ -559,16 +544,12 @@ Instructions:
 """
 
         user_text = user_input.strip()
-        
-        # Build comprehensive context
         context_parts = []
-        
         if context:
             context_parts.append(f"Local Knowledge Base Context:\n{context}")
-        
         if dialogue_history:
             context_parts.append(dialogue_history)
-        
+
         if context_parts:
             prompt_body = "\n\n---\n\n".join(context_parts) + f"\n\n---\n\nUser Question:\n{user_text}" + f"\n\n[STRICT LANGUAGE CONSTRAINT]\nTarget Language: {lang_display}\nYou MUST answer in {lang_display} only. Do not deviate from this language choice under any circumstances."
         else:
@@ -587,19 +568,13 @@ Instructions:
         temperature: float = 0.7,
         max_tokens: int = 512,
         enable_web_search: bool = True,
+        enable_real_time: bool = True,
         target_language: str = None,
         include_dialogue_history: bool = True
     ) -> Dict:
-        """
-        Generate response with all enhancements
-        Returns dict with response, sources, model used, language, etc.
-        """
         target_language = normalize_target_language(target_language)
-
-        # Retrieve local context
         local_context = self.knowledge_base.get_context_for_query(user_input, top_k=top_k)
-        
-        # Web search for fresh data
+
         search_results = []
         search_context = ""
         if enable_web_search:
@@ -614,34 +589,52 @@ Instructions:
                         f"Summary: {result['snippet']}"
                     )
                 search_context = "\n\n".join(search_context_parts)
-        
-        # Combine contexts
+
+        news_results = []
+        news_context = ""
+        if enable_real_time:
+            # Use real-time and latest public updates for current events, business, headlines, etc.
+            news_results = self.news_client.search(user_input, num_results=REAL_TIME_TOP_K)
+            if news_results:
+                news_context_parts = []
+                for i, item in enumerate(news_results, 1):
+                    summary = item.get("snippet", "").strip()
+                    if not summary:
+                        summary = "Latest public source update"
+                    news_context_parts.append(
+                        f"[News {i}]\n"
+                        f"Title: {item.get('title', '')}\n"
+                        f"Link: {item.get('link', '')}\n"
+                        f"Published: {item.get('published', '')}\n"
+                        f"Summary: {summary}"
+                    )
+                news_context = "\n\n".join(news_context_parts)
+
         combined_context = ""
-        if search_context and local_context:
-            combined_context = f"Web Search Results (Latest):\n{search_context}\n\n---\n\nLocal Knowledge Base:\n{local_context}"
-        elif search_context:
-            combined_context = f"Web Search Results (Latest):\n{search_context}"
-        elif local_context:
-            combined_context = local_context
-        
-        # Include dialogue history
+        context_blocks = []
+        if search_context:
+            context_blocks.append(f"Web Search Results (Latest):\n{search_context}")
+        if news_context:
+            context_blocks.append(f"Latest News (Real-Time):\n{news_context}")
+        if local_context:
+            context_blocks.append(f"Local Knowledge Base:\n{local_context}")
+        if context_blocks:
+            combined_context = "\n\n---\n\n".join(context_blocks)
+
         dialogue_history_str = ""
         if include_dialogue_history and self.conversation_history:
             dialogue_history_str = format_dialogue_history(self.conversation_history)
-        
-        # Build prompt
-        messages = self.create_prompt(user_input, combined_context, dialogue_history_str, target_language)
 
-        # Get response from Ollama
+        messages = self.create_prompt(user_input, combined_context, dialogue_history_str, target_language)
         reply = self.ollama_client.generate(messages, model=model, temperature=temperature, max_tokens=max_tokens)
 
-        # Store in conversation memory
         self.conversation_history.append({
             "user": user_input,
             "assistant": reply,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "context_used": bool(combined_context),
             "web_search_used": bool(search_results),
+            "news_used": bool(news_results),
             "model_used": model or self.ollama_client.model_name,
             "language": target_language
         })
@@ -655,6 +648,7 @@ Instructions:
             "language": target_language,
             "local_context_used": bool(local_context),
             "search_results": search_results,
+            "news_results": news_results,
             "dialogue_history_length": len(self.conversation_history)
         }
 
@@ -669,12 +663,13 @@ ollama_client = OllamaClient(
 )
 
 search_client = DuckDuckGoSearchClient()
+news_client = NewsRSSClient()
 knowledge_base = RAGKnowledgeBase(ollama_client, DATA_DIR)
 rag_model = None
 
 try:
     knowledge_base.load_documents()
-    rag_model = BilingualRAGLLM(ollama_client, knowledge_base, search_client)
+    rag_model = BilingualRAGLLM(ollama_client, knowledge_base, search_client, news_client)
     logger.info("RAG model initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize RAG model: {e}")
@@ -684,7 +679,6 @@ except Exception as e:
 def health_check():
     ollama_ok = ollama_client.test_connection()
     available_models = ollama_client.get_available_models() if ollama_ok else []
-    
     return jsonify({
         "status": "ok",
         "ollama_connected": ollama_ok,
@@ -692,7 +686,8 @@ def health_check():
         "default_model": OLLAMA_MODEL,
         "embedding_model": OLLAMA_EMBEDDING_MODEL,
         "web_search_enabled": search_client.enabled,
-        "search_provider": "DuckDuckGo (free, no API key required)",
+        "news_enabled": news_client.enabled,
+        "search_provider": "DuckDuckGo + Google News RSS",
         "supported_languages": ["english", "chinese_simplified", "chinese_traditional"],
         "knowledge_base_dir": DATA_DIR,
         "document_count": len(knowledge_base.documents),
@@ -701,7 +696,6 @@ def health_check():
 
 @app.route("/api/models", methods=["GET"])
 def get_models():
-    """Get list of available models from Ollama"""
     try:
         available_models = ollama_client.get_available_models()
         return jsonify({
@@ -714,7 +708,6 @@ def get_models():
 
 @app.route("/api/languages", methods=["GET"])
 def get_languages():
-    """Get list of supported languages and their aliases"""
     return jsonify({
         "status": "success",
         "supported_languages": {
@@ -740,12 +733,12 @@ def chat():
         if not user_message:
             return jsonify({"error": "Message cannot be empty"}), 400
 
-        # Extract optional parameters
-        model = data.get("model")  # Allow user to select model
+        model = data.get("model")
         top_k = int(data.get("top_k", TOP_K))
         temperature = float(data.get("temperature", 0.7))
         max_tokens = int(data.get("max_tokens", 512))
         enable_web_search = data.get("enable_web_search", True)
+        enable_real_time = data.get("enable_real_time", True)
         target_language = normalize_target_language(data.get("target_language"))
         include_dialogue_history = data.get("include_dialogue_history", True)
 
@@ -759,6 +752,7 @@ def chat():
             temperature=temperature,
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
+            enable_real_time=enable_real_time,
             target_language=target_language,
             include_dialogue_history=include_dialogue_history
         )
@@ -771,6 +765,7 @@ def chat():
             "language": result["language"],
             "local_context_used": result["local_context_used"],
             "search_results": result["search_results"],
+            "news_results": result["news_results"],
             "dialogue_history_length": result["dialogue_history_length"],
             "timestamp": datetime.now(timezone.utc).isoformat()
         }), 200
@@ -799,7 +794,7 @@ def status():
         "default_model": OLLAMA_MODEL,
         "embedding_model": OLLAMA_EMBEDDING_MODEL,
         "web_search_enabled": search_client.enabled,
-        "search_provider": "DuckDuckGo (free, no API key required)",
+        "news_enabled": news_client.enabled,
         "supported_languages": ["english", "chinese_simplified", "chinese_traditional"],
         "documents_loaded": len(knowledge_base.documents),
         "chunk_count": len(knowledge_base.texts),
@@ -817,13 +812,11 @@ def history():
 
 @app.route("/api/history", methods=["DELETE"])
 def clear_history():
-    """Clear conversation history"""
     if rag_model:
         rag_model.conversation_history = []
         return jsonify({"status": "success", "message": "Conversation history cleared"}), 200
     return jsonify({"error": "RAG model not initialized"}), 500
 
-# ===================== Simple Web UI =====================
 @app.route("/", methods=["GET"])
 def web_interface():
     return """
@@ -844,136 +837,37 @@ def web_interface():
                 align-items: center;
                 padding: 20px;
             }
-            .chat-wrap {
-                width: 100%;
-                max-width: 960px;
-                background: #fff;
-                border-radius: 16px;
-                box-shadow: 0 32px 80px rgba(0,0,0,0.2);
-                overflow: hidden;
-            }
-            .header {
-                background: linear-gradient(135deg, #1d4ed8, #2563eb);
-                color: white;
-                padding: 20px 24px;
-            }
+            .chat-wrap { width: 100%; max-width: 980px; background: #fff; border-radius: 16px; box-shadow: 0 32px 80px rgba(0,0,0,0.2); overflow: hidden; }
+            .header { background: linear-gradient(135deg, #1d4ed8, #2563eb); color: white; padding: 20px 24px; }
             .header h1 { font-size: 24px; margin-bottom: 6px; }
             .header p { opacity: 0.9; font-size: 14px; }
-            .controls {
-                background: #f0f4f8;
-                padding: 16px;
-                border-bottom: 1px solid #e2e8f0;
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 12px;
-            }
-            .control-group {
-                display: flex;
-                flex-direction: column;
-            }
-            .control-group label {
-                font-size: 12px;
-                font-weight: 600;
-                color: #475569;
-                margin-bottom: 4px;
-            }
-            .control-group select,
-            .control-group input {
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 8px;
-                font-size: 13px;
-                outline: none;
-            }
-            .control-group input[type="checkbox"] {
-                width: 16px;
-                height: 16px;
-                cursor: pointer;
-            }
-            .messages {
-                height: 50vh;
-                overflow-y: auto;
-                padding: 20px;
-                background: #f8fafc;
-            }
-            .message {
-                margin-bottom: 16px;
-                display: flex;
-                flex-direction: column;
-            }
+            .controls { background: #f0f4f8; padding: 16px; border-bottom: 1px solid #e2e8f0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+            .control-group { display: flex; flex-direction: column; }
+            .control-group label { font-size: 12px; font-weight: 600; color: #475569; margin-bottom: 4px; }
+            .control-group select, .control-group input { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px; font-size: 13px; outline: none; }
+            .control-group input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+            .messages { height: 50vh; overflow-y: auto; padding: 20px; background: #f8fafc; }
+            .message { margin-bottom: 16px; display: flex; flex-direction: column; }
             .message.user { align-items: flex-end; }
             .message.assistant { align-items: flex-start; }
-            .bubble {
-                max-width: 75%;
-                padding: 12px 14px;
-                border-radius: 14px;
-                line-height: 1.5;
-                font-size: 15px;
-                white-space: pre-wrap;
-                word-wrap: break-word;
-            }
-            .message.user .bubble {
-                background: #2563eb;
-                color: white;
-                border-bottom-right-radius: 4px;
-            }
-            .message.assistant .bubble {
-                background: #e2e8f0;
-                color: #0f172a;
-                border-bottom-left-radius: 4px;
-            }
-            .meta {
-                font-size: 12px;
-                color: #64748b;
-                margin-top: 6px;
-                padding: 0 4px;
-            }
-            .composer {
-                display: flex;
-                gap: 10px;
-                padding: 16px 18px;
-                background: white;
-                border-top: 1px solid #e2e8f0;
-            }
-            input[type="text"] {
-                flex: 1;
-                border: 1px solid #cbd5e1;
-                border-radius: 12px;
-                padding: 12px 14px;
-                font-size: 15px;
-                outline: none;
-            }
-            button {
-                border: none;
-                border-radius: 12px;
-                padding: 12px 20px;
-                font-size: 15px;
-                font-weight: 600;
-                background: #2563eb;
-                color: white;
-                cursor: pointer;
-            }
+            .bubble { max-width: 75%; padding: 12px 14px; border-radius: 14px; line-height: 1.5; font-size: 15px; white-space: pre-wrap; word-wrap: break-word; }
+            .message.user .bubble { background: #2563eb; color: white; border-bottom-right-radius: 4px; }
+            .message.assistant .bubble { background: #e2e8f0; color: #0f172a; border-bottom-left-radius: 4px; }
+            .meta { font-size: 12px; color: #64748b; margin-top: 6px; padding: 0 4px; }
+            .composer { display: flex; gap: 10px; padding: 16px 18px; background: white; border-top: 1px solid #e2e8f0; }
+            input[type="text"] { flex: 1; border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px 14px; font-size: 15px; outline: none; }
+            button { border: none; border-radius: 12px; padding: 12px 20px; font-size: 15px; font-weight: 600; background: #2563eb; color: white; cursor: pointer; }
             button:hover { background: #1d4ed8; }
-            button.secondary {
-                background: #64748b;
-                padding: 8px 12px;
-                font-size: 12px;
-            }
+            button.secondary { background: #64748b; padding: 8px 12px; font-size: 12px; }
             button.secondary:hover { background: #475569; }
-            .status {
-                padding: 10px 18px 16px;
-                color: #475569;
-                font-size: 12px;
-                background: #fff;
-                border-top: 1px solid #e2e8f0;
-            }
+            .status { padding: 10px 18px 16px; color: #475569; font-size: 12px; background: #fff; border-top: 1px solid #e2e8f0; }
         </style>
     </head>
     <body>
         <div class="chat-wrap">
             <div class="header">
                 <h1>🤖 Bilingual RAG Chat - Enhanced</h1>
-                <p>Powered by Ollama + Local KB + DuckDuckGo Search + Time-Aware Responses</p>
+                <p>Powered by Ollama + Local KB + DuckDuckGo + Google News RSS + Time-Aware Responses</p>
             </div>
 
             <div class="controls">
@@ -983,7 +877,6 @@ def web_interface():
                         <option value="">Default (Gemma:latest)</option>
                     </select>
                 </div>
-                
                 <div class="control-group">
                     <label for="languageSelect">Target Language:</label>
                     <select id="languageSelect">
@@ -993,36 +886,29 @@ def web_interface():
                         <option value="chinese_traditional">Traditional Chinese (繁體中文)</option>
                     </select>
                 </div>
-
                 <div class="control-group">
-                    <label for="webSearch">
-                        <input type="checkbox" id="webSearch" checked /> Web Search
-                    </label>
+                    <label for="webSearch"><input type="checkbox" id="webSearch" checked /> Web Search</label>
                 </div>
-
                 <div class="control-group">
-                    <label for="dialogueHistory">
-                        <input type="checkbox" id="dialogueHistory" checked /> Use History
-                    </label>
+                    <label for="realTimeNews"><input type="checkbox" id="realTimeNews" checked /> Real-Time News</label>
                 </div>
-
+                <div class="control-group">
+                    <label for="dialogueHistory"><input type="checkbox" id="dialogueHistory" checked /> Use History</label>
+                </div>
                 <div class="control-group">
                     <button class="secondary" onclick="clearHistory()">Clear History</button>
                 </div>
             </div>
 
             <div id="messages" class="messages"></div>
-
             <div class="composer">
                 <input id="messageInput" type="text" placeholder="Type your message... (输入中英文都可)" />
                 <button onclick="sendMessage()">Send</button>
             </div>
-
-            <div class="status" id="statusBar">Ready (Supports: English, Simplified Chinese, Traditional Chinese)</div>
+            <div class="status" id="statusBar">Ready (Supports: English, Simplified Chinese, Traditional Chinese; real-time news enabled)</div>
         </div>
 
         <script>
-            // Load available models on startup
             async function loadModels() {
                 try {
                     const response = await fetch('/api/models');
@@ -1033,9 +919,7 @@ def web_interface():
                             const option = document.createElement('option');
                             option.value = model;
                             option.textContent = model;
-                            if (model === data.default_model) {
-                                option.textContent += ' (default)';
-                            }
+                            if (model === data.default_model) option.textContent += ' (default)';
                             select.appendChild(option);
                         });
                     }
@@ -1051,7 +935,6 @@ def web_interface():
 
                 addMessage('user', text);
                 input.value = '';
-
                 const statusBar = document.getElementById('statusBar');
                 statusBar.textContent = 'Thinking...';
 
@@ -1064,6 +947,7 @@ def web_interface():
                             model: document.getElementById('modelSelect').value || null,
                             target_language: document.getElementById('languageSelect').value || null,
                             enable_web_search: document.getElementById('webSearch').checked,
+                            enable_real_time: document.getElementById('realTimeNews').checked,
                             include_dialogue_history: document.getElementById('dialogueHistory').checked,
                             top_k: 4,
                             temperature: 0.7,
@@ -1079,20 +963,16 @@ def web_interface():
                     }
 
                     const sourceInfo = [];
-                    if (data.search_results && data.search_results.length > 0) {
-                        sourceInfo.push(`🌐 DuckDuckGo (${data.search_results.length} results)`);
-                    }
-                    if (data.local_context_used) {
-                        sourceInfo.push('📚 Local KB');
-                    }
-                    
+                    if (data.news_results && data.news_results.length > 0) sourceInfo.push(`📰 News (${data.news_results.length})`);
+                    if (data.search_results && data.search_results.length > 0) sourceInfo.push(`🌐 Web (${data.search_results.length})`);
+                    if (data.local_context_used) sourceInfo.push('📚 Local KB');
+
                     addMessage('assistant', data.response, {
                         model: data.model_used,
                         language: data.language,
                         sources: sourceInfo.join(' + ') || 'No external sources',
                         history_length: data.dialogue_history_length
                     });
-                    
                     statusBar.textContent = `Ready • History: ${data.dialogue_history_length} turns • Lang: ${data.language}`;
                 } catch (err) {
                     addMessage('assistant', 'Connection error. Please check Ollama is running.');
@@ -1146,15 +1026,13 @@ def web_interface():
                 if (e.key === 'Enter') sendMessage();
             });
 
-            // Initialize on load
             loadModels();
-            addMessage('assistant', 'Hello! I am your enhanced multilingual AI assistant with time awareness. I support English, Simplified Chinese (简体中文), and Traditional Chinese (繁體中文). I can search the web via DuckDuckGo (no API key required!), understand current dates/times, remember our conversation, and support multiple models. Ask me anything! 👋');
+            addMessage('assistant', 'Hello! I am your enhanced multilingual AI assistant with real-time public news access. I can answer with local KB, web search, and latest Google News RSS updates, while strictly following your chosen language. Ask me anything! 👋');
         </script>
     </body>
     </html>
     """
 
-# ===================== Error Handlers =====================
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -1163,19 +1041,18 @@ def not_found(error):
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
-# ===================== Main Entry =====================
 if __name__ == "__main__":
     logger.info("=" * 70)
     logger.info("ENHANCED Multilingual Dialogue RAG API")
     logger.info("Features: English, Simplified Chinese, Traditional Chinese")
-    logger.info("Features: DuckDuckGo Search + Time-Aware Responses + Dynamic Model Selection + Dialogue History")
+    logger.info("Features: DuckDuckGo Search + Google News RSS + Time-Aware Responses + Dynamic Model Selection + Dialogue History")
     logger.info("=" * 70)
     logger.info(f"Ollama API URL: {OLLAMA_API_URL}")
     logger.info(f"Chat model: {OLLAMA_MODEL}")
     logger.info(f"Embedding model: {OLLAMA_EMBEDDING_MODEL}")
     logger.info(f"Supported Languages: English, Simplified Chinese (简体中文), Traditional Chinese (繁體中文)")
-    logger.info(f"Web Search: ENABLED (DuckDuckGo - free, no API key required, with retry logic for 202/429 responses)")
-    logger.info(f"Time-Aware Responses: ENABLED (current UTC and local time provided in system prompt)")
+    logger.info(f"Web Search: ENABLED (DuckDuckGo - free, no API key required)")
+    logger.info(f"Real-Time News: ENABLED (Google News RSS - no API key required)")
     logger.info(f"Language Enforcement: STRICT (responses strictly follow target language constraint)")
     logger.info(f"Knowledge base directory: {DATA_DIR}")
     logger.info(f"Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}, Top K: {TOP_K}")
