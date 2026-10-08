@@ -3,7 +3,8 @@ Bilingual Dialogue RAG API - Enhanced Backend
 Single-mode LLM chatbot with web interface and API callback support
 Supports both Chinese and English dialogue with RAG (Retrieval Augmented Generation)
 Works with Ollama for generation and embeddings
-NOW INCLUDES: Google Search integration, dynamic model selection, language control, dialogue history
+NOW INCLUDES: DuckDuckGo Search integration, dynamic model selection, language control, dialogue history
+SUPPORTS: Simplified Chinese, Traditional Chinese, English with strict language enforcement
 """
 
 import os
@@ -11,7 +12,8 @@ import re
 import json
 import logging
 import math
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 
@@ -26,8 +28,6 @@ logger = logging.getLogger(__name__)
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "Gemma:latest")
 OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GOOGLE_SEARCH_ENGINE_ID = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
 
 API_HOST = os.getenv("API_HOST", "203.64.95.228")
 API_PORT = int(os.getenv("API_PORT", "8000"))
@@ -37,7 +37,26 @@ DATA_DIR = os.getenv("DATA_DIR", "./knowledge_base")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "600"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 TOP_K = int(os.getenv("TOP_K", "4"))
-GOOGLE_SEARCH_TOP_K = int(os.getenv("GOOGLE_SEARCH_TOP_K", "3"))
+SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "3"))
+
+# Language definitions
+LANGUAGE_OPTIONS = {
+    "english": "English",
+    "en": "English",
+    "eng": "English",
+    "chinese_simplified": "Simplified Chinese (简体中文)",
+    "zh_cn": "Simplified Chinese (简体中文)",
+    "zh-cn": "Simplified Chinese (简体中文)",
+    "zhcn": "Simplified Chinese (简体中文)",
+    "simplified": "Simplified Chinese (简体中文)",
+    "mandarin": "Simplified Chinese (简体中文)",
+    "chinese_traditional": "Traditional Chinese (繁體中文)",
+    "zh_tw": "Traditional Chinese (繁體中文)",
+    "zh-tw": "Traditional Chinese (繁體中文)",
+    "zhtw": "Traditional Chinese (繁體中文)",
+    "traditional": "Traditional Chinese (繁體中文)",
+    "cantonese": "Traditional Chinese (繁體中文)",
+}
 
 # ===================== Ollama Client =====================
 class OllamaClient:
@@ -142,47 +161,123 @@ class OllamaClient:
             logger.error(f"Error in Ollama generation: {str(e)}")
             return "I encountered an error generating a response."
 
-# ===================== Google Search Client =====================
-class GoogleSearchClient:
-    def __init__(self, api_key: str, search_engine_id: str):
-        self.api_key = api_key
-        self.search_engine_id = search_engine_id
-        self.enabled = bool(api_key and search_engine_id)
-        self.endpoint = "https://www.googleapis.com/customsearch/v1"
+# ===================== DuckDuckGo Search Client =====================
+class DuckDuckGoSearchClient:
+    """
+    Free web search using DuckDuckGo API
+    No API key required, no authentication needed
+    Includes retry logic for rate limiting and timing issues (202 Accepted responses)
+    """
+    def __init__(self):
+        self.endpoint = "https://api.duckduckgo.com"
+        self.enabled = True
+        self.session = requests.Session()
+        # Set proper User-Agent to avoid blocking
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        })
+        logger.info("DuckDuckGo Search Client initialized (free, no API key required)")
 
     def search(self, query: str, num_results: int = 3) -> List[Dict[str, str]]:
         """
-        Search Google Custom Search API
+        Search DuckDuckGo without API key
         Returns list of dicts with 'title', 'link', 'snippet'
+        Includes retry logic for 202 (Accepted) and 429 (Rate Limited) responses
         """
-        if not self.enabled:
-            logger.warning("Google Search not configured (missing GOOGLE_API_KEY or GOOGLE_SEARCH_ENGINE_ID)")
+        if not query or not query.strip():
             return []
-
-        try:
-            params = {
-                "key": self.api_key,
-                "cx": self.search_engine_id,
-                "q": query,
-                "num": min(num_results, 10)
-            }
-            response = requests.get(self.endpoint, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                results = []
-                for item in data.get("items", []):
-                    results.append({
-                        "title": item.get("title", ""),
-                        "link": item.get("link", ""),
-                        "snippet": item.get("snippet", "")
-                    })
-                return results
-            else:
-                logger.warning(f"Google Search API error: {response.status_code}")
+        
+        max_retries = 2
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                params = {
+                    "q": query.strip(),
+                    "format": "json",
+                    "no_html": 1,
+                    "skip_disambig": 1,
+                    "kl": "en-us"
+                }
+                
+                response = self.session.get(
+                    self.endpoint,
+                    params=params,
+                    timeout=15
+                )
+                
+                # Handle different status codes
+                if response.status_code == 200:
+                    data = response.json()
+                    results = []
+                    
+                    # Get instant answer/abstract
+                    if data.get("AbstractText"):
+                        results.append({
+                            "title": data.get("Heading", query),
+                            "link": data.get("AbstractURL", ""),
+                            "snippet": data.get("AbstractText", "")
+                        })
+                    
+                    # Get related topics as additional results
+                    if data.get("RelatedTopics") and len(results) < num_results:
+                        for topic in data["RelatedTopics"]:
+                            if isinstance(topic, dict) and "Text" in topic:
+                                results.append({
+                                    "title": topic.get("Text", "").split(" - ")[0] if " - " in topic.get("Text", "") else topic.get("Text", ""),
+                                    "link": topic.get("FirstURL", ""),
+                                    "snippet": topic.get("Text", "")
+                                })
+                            if len(results) >= num_results:
+                                break
+                    
+                    return results[:num_results]
+                
+                elif response.status_code == 202:
+                    # 202 = Accepted but processing - retry after delay
+                    if attempt < max_retries - 1:
+                        logger.debug(f"DuckDuckGo API returned 202 (processing). Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    else:
+                        logger.warning(f"DuckDuckGo API still processing after {max_retries} attempts. Returning empty results.")
+                        return []
+                
+                elif response.status_code == 429:
+                    # Rate limited - back off
+                    if attempt < max_retries - 1:
+                        logger.debug(f"DuckDuckGo rate limit (429). Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    else:
+                        logger.warning("DuckDuckGo rate limited. Returning empty results.")
+                        return []
+                
+                else:
+                    logger.warning(f"DuckDuckGo API error: {response.status_code} - {response.text[:200]}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    return []
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"DuckDuckGo search timeout (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
                 return []
-        except Exception as e:
-            logger.warning(f"Google Search failed: {e}")
-            return []
+            except Exception as e:
+                logger.warning(f"DuckDuckGo search failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                return []
+        
+        return []
 
 # ===================== Text Chunking =====================
 def split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -353,13 +448,36 @@ def extract_terms(text: str) -> List[str]:
 def detect_language(text: str) -> str:
     """
     Detect if text is primarily Chinese or English
-    Returns 'chinese' or 'english'
+    Returns 'english' or 'chinese_simplified' (default for Chinese)
     """
     chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
     english_chars = len(re.findall(r"[a-zA-Z]", text))
     
     if chinese_chars > english_chars:
-        return "chinese"
+        return "chinese_simplified"  # Default to Simplified Chinese
+    return "english"
+
+def normalize_target_language(target_language: Optional[str]) -> str:
+    """
+    Normalize language input to one of: english, chinese_simplified, chinese_traditional
+    Handles aliases and aliases like 'zh-cn', 'traditional', etc.
+    """
+    if target_language is None or target_language == "":
+        return "english"
+
+    normalized = str(target_language).strip().lower()
+    
+    # Check against LANGUAGE_OPTIONS
+    if normalized in LANGUAGE_OPTIONS:
+        lang_desc = LANGUAGE_OPTIONS[normalized]
+        if "Simplified" in lang_desc:
+            return "chinese_simplified"
+        elif "Traditional" in lang_desc:
+            return "chinese_traditional"
+        elif "English" in lang_desc:
+            return "english"
+    
+    # Default fallback
     return "english"
 
 def format_dialogue_history(history: List[Dict]) -> str:
@@ -375,42 +493,69 @@ def format_dialogue_history(history: List[Dict]) -> str:
     
     return formatted
 
+def get_current_time_context() -> str:
+    """Get current time in multiple formats for context awareness"""
+    now = datetime.now(timezone.utc)
+    local_now = datetime.now()
+    
+    return f"""Current Time Information:
+- UTC Time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}
+- Local Time: {local_now.strftime('%Y-%m-%d %H:%M:%S')}
+- Day of Week: {local_now.strftime('%A')}
+- ISO Format: {now.isoformat()}"""
+
 # ===================== RAG LLM Wrapper =====================
 class BilingualRAGLLM:
-    def __init__(self, ollama_client: OllamaClient, knowledge_base: RAGKnowledgeBase, google_client: GoogleSearchClient):
+    def __init__(self, ollama_client: OllamaClient, knowledge_base: RAGKnowledgeBase, search_client: DuckDuckGoSearchClient):
         self.ollama_client = ollama_client
         self.knowledge_base = knowledge_base
-        self.google_client = google_client
+        self.search_client = search_client
         self.conversation_history: List[Dict] = []
 
     def create_prompt(self, user_input: str, context: str = "", dialogue_history: str = "", target_language: str = None) -> List[Dict]:
         """
         Create prompt with:
         - Local knowledge base context
-        - Google search results
+        - Web search results
         - Dialogue history
-        - Target language instruction
+        - Current time information
+        - STRICT output-language instruction (English, Simplified Chinese, or Traditional Chinese)
         """
-        # Detect language if not specified
-        if target_language is None:
-            target_language = detect_language(user_input)
-        
-        if target_language == "chinese":
-            lang_instruction = "请使用中文回答。"
+        target_language = normalize_target_language(target_language)
+
+        # Language-specific instructions
+        if target_language == "chinese_simplified":
+            lang_instruction = "请严格使用简体中文回答。不要混用繁体字。不要切换到英文。回答内容必须全部为简体中文，除非用户明确要求输出代码时，代码块中的语法关键字可以保持原样。"
+            response_rule = "Output language: Simplified Chinese ONLY. 严格使用简体中文。不允许切换到英文或繁体中文。"
+            lang_display = "Simplified Chinese"
+        elif target_language == "chinese_traditional":
+            lang_instruction = "請嚴格使用繁體中文回答。不要混用簡體字。不要切換到英文。回答內容必須全部為繁體中文，除非用戶明確要求輸出代碼時，代碼塊中的語法關鍵字可以保持原樣。"
+            response_rule = "Output language: Traditional Chinese ONLY. 請嚴格使用繁體中文。不允許切換到英文或簡體中文。"
+            lang_display = "Traditional Chinese"
         else:
-            lang_instruction = "Please answer in English."
+            lang_instruction = "Please answer strictly in English. Do not switch to Chinese. The entire response must be in English, except code syntax itself which may stay as-is."
+            response_rule = "Output language: English ONLY. Do not answer in Chinese. Do not mix languages."
+            lang_display = "English"
+
+        time_context = get_current_time_context()
 
         system_prompt = f"""
-You are a helpful bilingual assistant that can answer questions in both Chinese and English.
+You are a helpful multilingual assistant that can answer questions in English, Simplified Chinese, and Traditional Chinese.
 {lang_instruction}
+{response_rule}
+
+{time_context}
 
 Instructions:
 - Use the provided context from local knowledge base and latest web search results if available.
+- Be aware of the current date and time when answering questions about timing, schedules, or recent events.
 - If the answer is not found in the provided context, say so clearly.
 - Consider the conversation history to maintain context and coherence.
 - Keep the answer concise, practical, and easy to understand.
 - If asked for code, provide clean, working code.
+- NEVER mix languages in the final answer. Keep the answer in the target language only.
 - Do not fabricate facts; rely on provided sources.
+- Remember: You MUST follow the output language constraint strictly. The user's language choice is binding.
 """
 
         user_text = user_input.strip()
@@ -425,9 +570,9 @@ Instructions:
             context_parts.append(dialogue_history)
         
         if context_parts:
-            prompt_body = "\n\n---\n\n".join(context_parts) + f"\n\n---\n\nUser Question:\n{user_text}"
+            prompt_body = "\n\n---\n\n".join(context_parts) + f"\n\n---\n\nUser Question:\n{user_text}" + f"\n\n[STRICT LANGUAGE CONSTRAINT]\nTarget Language: {lang_display}\nYou MUST answer in {lang_display} only. Do not deviate from this language choice under any circumstances."
         else:
-            prompt_body = user_text
+            prompt_body = user_text + f"\n\n[STRICT LANGUAGE CONSTRAINT]\nTarget Language: {lang_display}\nYou MUST answer in {lang_display} only. Do not deviate from this language choice under any circumstances."
 
         return [
             {"role": "system", "content": system_prompt},
@@ -441,7 +586,7 @@ Instructions:
         top_k: int = TOP_K,
         temperature: float = 0.7,
         max_tokens: int = 512,
-        enable_google_search: bool = True,
+        enable_web_search: bool = True,
         target_language: str = None,
         include_dialogue_history: bool = True
     ) -> Dict:
@@ -449,32 +594,33 @@ Instructions:
         Generate response with all enhancements
         Returns dict with response, sources, model used, language, etc.
         """
-        
+        target_language = normalize_target_language(target_language)
+
         # Retrieve local context
         local_context = self.knowledge_base.get_context_for_query(user_input, top_k=top_k)
         
-        # Google search for fresh data
-        google_results = []
-        google_context = ""
-        if enable_google_search:
-            google_results = self.google_client.search(user_input, num_results=GOOGLE_SEARCH_TOP_K)
-            if google_results:
-                google_context_parts = []
-                for i, result in enumerate(google_results, 1):
-                    google_context_parts.append(
+        # Web search for fresh data
+        search_results = []
+        search_context = ""
+        if enable_web_search:
+            search_results = self.search_client.search(user_input, num_results=SEARCH_TOP_K)
+            if search_results:
+                search_context_parts = []
+                for i, result in enumerate(search_results, 1):
+                    search_context_parts.append(
                         f"[Web Result {i}]\n"
                         f"Title: {result['title']}\n"
                         f"Link: {result['link']}\n"
                         f"Summary: {result['snippet']}"
                     )
-                google_context = "\n\n".join(google_context_parts)
+                search_context = "\n\n".join(search_context_parts)
         
         # Combine contexts
         combined_context = ""
-        if google_context and local_context:
-            combined_context = f"Web Search Results (Latest):\n{google_context}\n\n---\n\nLocal Knowledge Base:\n{local_context}"
-        elif google_context:
-            combined_context = f"Web Search Results (Latest):\n{google_context}"
+        if search_context and local_context:
+            combined_context = f"Web Search Results (Latest):\n{search_context}\n\n---\n\nLocal Knowledge Base:\n{local_context}"
+        elif search_context:
+            combined_context = f"Web Search Results (Latest):\n{search_context}"
         elif local_context:
             combined_context = local_context
         
@@ -482,10 +628,6 @@ Instructions:
         dialogue_history_str = ""
         if include_dialogue_history and self.conversation_history:
             dialogue_history_str = format_dialogue_history(self.conversation_history)
-        
-        # Detect language if not specified
-        if target_language is None:
-            target_language = detect_language(user_input)
         
         # Build prompt
         messages = self.create_prompt(user_input, combined_context, dialogue_history_str, target_language)
@@ -497,9 +639,9 @@ Instructions:
         self.conversation_history.append({
             "user": user_input,
             "assistant": reply,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "context_used": bool(combined_context),
-            "google_search_used": bool(google_results),
+            "web_search_used": bool(search_results),
             "model_used": model or self.ollama_client.model_name,
             "language": target_language
         })
@@ -512,7 +654,7 @@ Instructions:
             "model_used": model or self.ollama_client.model_name,
             "language": target_language,
             "local_context_used": bool(local_context),
-            "google_results": google_results,
+            "search_results": search_results,
             "dialogue_history_length": len(self.conversation_history)
         }
 
@@ -526,13 +668,13 @@ ollama_client = OllamaClient(
     embedding_model=OLLAMA_EMBEDDING_MODEL
 )
 
-google_client = GoogleSearchClient(GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID)
+search_client = DuckDuckGoSearchClient()
 knowledge_base = RAGKnowledgeBase(ollama_client, DATA_DIR)
 rag_model = None
 
 try:
     knowledge_base.load_documents()
-    rag_model = BilingualRAGLLM(ollama_client, knowledge_base, google_client)
+    rag_model = BilingualRAGLLM(ollama_client, knowledge_base, search_client)
     logger.info("RAG model initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize RAG model: {e}")
@@ -549,10 +691,12 @@ def health_check():
         "available_models": available_models,
         "default_model": OLLAMA_MODEL,
         "embedding_model": OLLAMA_EMBEDDING_MODEL,
-        "google_search_enabled": google_client.enabled,
+        "web_search_enabled": search_client.enabled,
+        "search_provider": "DuckDuckGo (free, no API key required)",
+        "supported_languages": ["english", "chinese_simplified", "chinese_traditional"],
         "knowledge_base_dir": DATA_DIR,
         "document_count": len(knowledge_base.documents),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
 
 @app.route("/api/models", methods=["GET"])
@@ -567,6 +711,23 @@ def get_models():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/languages", methods=["GET"])
+def get_languages():
+    """Get list of supported languages and their aliases"""
+    return jsonify({
+        "status": "success",
+        "supported_languages": {
+            "english": ["en", "eng", "english"],
+            "chinese_simplified": ["zh_cn", "zh-cn", "zhcn", "simplified", "mandarin"],
+            "chinese_traditional": ["zh_tw", "zh-tw", "zhtw", "traditional", "cantonese"]
+        },
+        "description": {
+            "english": "English",
+            "chinese_simplified": "Simplified Chinese (简体中文)",
+            "chinese_traditional": "Traditional Chinese (繁體中文)"
+        }
+    }), 200
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -584,8 +745,8 @@ def chat():
         top_k = int(data.get("top_k", TOP_K))
         temperature = float(data.get("temperature", 0.7))
         max_tokens = int(data.get("max_tokens", 512))
-        enable_google_search = data.get("enable_google_search", True)
-        target_language = data.get("target_language")  # 'english' or 'chinese'
+        enable_web_search = data.get("enable_web_search", True)
+        target_language = normalize_target_language(data.get("target_language"))
         include_dialogue_history = data.get("include_dialogue_history", True)
 
         if rag_model is None:
@@ -597,7 +758,7 @@ def chat():
             top_k=top_k,
             temperature=temperature,
             max_tokens=max_tokens,
-            enable_google_search=enable_google_search,
+            enable_web_search=enable_web_search,
             target_language=target_language,
             include_dialogue_history=include_dialogue_history
         )
@@ -609,9 +770,9 @@ def chat():
             "model_used": result["model_used"],
             "language": result["language"],
             "local_context_used": result["local_context_used"],
-            "google_results": result["google_results"],
+            "search_results": result["search_results"],
             "dialogue_history_length": result["dialogue_history_length"],
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }), 200
 
     except Exception as e:
@@ -637,12 +798,15 @@ def status():
         "ollama_connected": ollama_client.test_connection(),
         "default_model": OLLAMA_MODEL,
         "embedding_model": OLLAMA_EMBEDDING_MODEL,
-        "google_search_enabled": google_client.enabled,
+        "web_search_enabled": search_client.enabled,
+        "search_provider": "DuckDuckGo (free, no API key required)",
+        "supported_languages": ["english", "chinese_simplified", "chinese_traditional"],
         "documents_loaded": len(knowledge_base.documents),
         "chunk_count": len(knowledge_base.texts),
         "top_k": TOP_K,
         "data_dir": DATA_DIR,
-        "conversation_turns": len(rag_model.conversation_history) if rag_model else 0
+        "conversation_turns": len(rag_model.conversation_history) if rag_model else 0,
+        "current_time": datetime.now(timezone.utc).isoformat()
     }), 200
 
 @app.route("/api/history", methods=["GET"])
@@ -764,11 +928,6 @@ def web_interface():
                 margin-top: 6px;
                 padding: 0 4px;
             }
-            .source-indicator {
-                font-size: 11px;
-                color: #7c3aed;
-                margin-top: 4px;
-            }
             .composer {
                 display: flex;
                 gap: 10px;
@@ -814,7 +973,7 @@ def web_interface():
         <div class="chat-wrap">
             <div class="header">
                 <h1>🤖 Bilingual RAG Chat - Enhanced</h1>
-                <p>Powered by Ollama + Local KB + Google Search + Dialogue Memory</p>
+                <p>Powered by Ollama + Local KB + DuckDuckGo Search + Time-Aware Responses</p>
             </div>
 
             <div class="controls">
@@ -829,14 +988,15 @@ def web_interface():
                     <label for="languageSelect">Target Language:</label>
                     <select id="languageSelect">
                         <option value="">Auto-detect</option>
-                        <option value="english">English</option>
-                        <option value="chinese">Chinese</option>
+                        <option value="english">English (English)</option>
+                        <option value="chinese_simplified">Simplified Chinese (简体中文)</option>
+                        <option value="chinese_traditional">Traditional Chinese (繁體中文)</option>
                     </select>
                 </div>
 
                 <div class="control-group">
-                    <label for="googleSearch">
-                        <input type="checkbox" id="googleSearch" checked /> Google Search
+                    <label for="webSearch">
+                        <input type="checkbox" id="webSearch" checked /> Web Search
                     </label>
                 </div>
 
@@ -858,7 +1018,7 @@ def web_interface():
                 <button onclick="sendMessage()">Send</button>
             </div>
 
-            <div class="status" id="statusBar">Ready</div>
+            <div class="status" id="statusBar">Ready (Supports: English, Simplified Chinese, Traditional Chinese)</div>
         </div>
 
         <script>
@@ -903,7 +1063,7 @@ def web_interface():
                             message: text,
                             model: document.getElementById('modelSelect').value || null,
                             target_language: document.getElementById('languageSelect').value || null,
-                            enable_google_search: document.getElementById('googleSearch').checked,
+                            enable_web_search: document.getElementById('webSearch').checked,
                             include_dialogue_history: document.getElementById('dialogueHistory').checked,
                             top_k: 4,
                             temperature: 0.7,
@@ -919,8 +1079,8 @@ def web_interface():
                     }
 
                     const sourceInfo = [];
-                    if (data.google_results && data.google_results.length > 0) {
-                        sourceInfo.push(`🌐 Google (${data.google_results.length} results)`);
+                    if (data.search_results && data.search_results.length > 0) {
+                        sourceInfo.push(`🌐 DuckDuckGo (${data.search_results.length} results)`);
                     }
                     if (data.local_context_used) {
                         sourceInfo.push('📚 Local KB');
@@ -988,7 +1148,7 @@ def web_interface():
 
             // Initialize on load
             loadModels();
-            addMessage('assistant', 'Hello! I am your enhanced bilingual AI assistant. I can now search Google for latest information, use dialogue memory, and support multiple models. Ask me anything in Chinese or English!');
+            addMessage('assistant', 'Hello! I am your enhanced multilingual AI assistant with time awareness. I support English, Simplified Chinese (简体中文), and Traditional Chinese (繁體中文). I can search the web via DuckDuckGo (no API key required!), understand current dates/times, remember our conversation, and support multiple models. Ask me anything! 👋');
         </script>
     </body>
     </html>
@@ -1006,13 +1166,17 @@ def internal_error(error):
 # ===================== Main Entry =====================
 if __name__ == "__main__":
     logger.info("=" * 70)
-    logger.info("ENHANCED Bilingual Dialogue RAG API")
-    logger.info("Features: Google Search + Dynamic Model Selection + Language Control + Dialogue History")
+    logger.info("ENHANCED Multilingual Dialogue RAG API")
+    logger.info("Features: English, Simplified Chinese, Traditional Chinese")
+    logger.info("Features: DuckDuckGo Search + Time-Aware Responses + Dynamic Model Selection + Dialogue History")
     logger.info("=" * 70)
     logger.info(f"Ollama API URL: {OLLAMA_API_URL}")
     logger.info(f"Chat model: {OLLAMA_MODEL}")
     logger.info(f"Embedding model: {OLLAMA_EMBEDDING_MODEL}")
-    logger.info(f"Google Search: {'ENABLED' if google_client.enabled else 'DISABLED (set GOOGLE_API_KEY & GOOGLE_SEARCH_ENGINE_ID)'}")
+    logger.info(f"Supported Languages: English, Simplified Chinese (简体中文), Traditional Chinese (繁體中文)")
+    logger.info(f"Web Search: ENABLED (DuckDuckGo - free, no API key required, with retry logic for 202/429 responses)")
+    logger.info(f"Time-Aware Responses: ENABLED (current UTC and local time provided in system prompt)")
+    logger.info(f"Language Enforcement: STRICT (responses strictly follow target language constraint)")
     logger.info(f"Knowledge base directory: {DATA_DIR}")
     logger.info(f"Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}, Top K: {TOP_K}")
     logger.info(f"Starting server on {API_HOST}:{API_PORT}")
